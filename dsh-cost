@@ -1,0 +1,451 @@
+#!/usr/bin/env node
+/**
+ * dsh-cost — 查看当前（或指定）DSH 会话花了多少钱、账户还剩多少钱。
+ *
+ * 用法:
+ *   dsh-cost                 # 最近活动的会话
+ *   dsh-cost --session <id>  # 指定会话（id 前缀即可）
+ *   dsh-cost --all           # 全部会话合计
+ *   dsh-cost --today         # 今天（按会话最后活动时间）
+ *   dsh-cost --json          # 机器可读
+ *   dsh-cost --balance       # 只查余额（不读会话）
+ *   dsh-cost --no-net        # 不联网，只算本地费用
+ *   dsh-cost --peak          # 只报当前是高峰还是空闲（不读会话、不联网）
+ *
+ * 说明:
+ *   - 费用 = 会话日志里每次模型调用的真实 token 数 × 官方单价，
+ *     按调用发生时刻判断高峰/空闲时段。
+ *     高峰 = 北京时间周一至周五（不含法定节假日）9-12、14-18；
+ *     其余时段（含周末、法定节假日全天）为空闲，单价为高峰的一半。
+ *     节假日表见下方 HOLIDAY_RANGES，可用 $DSH_HOME/tools/holidays.json 覆盖。
+ *   - 输出第一行固定为「现在高峰/空闲 + 下次切换时刻」，供用户判断要不要用 DeepSeek。
+ *   - 余额来自 https://api.deepseek.com/user/balance，实时。
+ *   - 价格表可用 $DSH_HOME/tools/prices.json 覆盖。
+ */
+'use strict';
+const fs = require('fs');
+const path = require('path');
+const zlib = require('zlib');
+const { execFileSync } = require('child_process');
+
+const DSH_HOME = process.env.DSH_HOME ||
+  path.join(__dirname, "../../payload/dshhome");
+const CURL = process.env.CURL || 'curl';
+const TZ = 'Asia/Shanghai';
+
+/* ---------------- 价格表：元 / 百万 tokens；[空闲, 高峰] ---------------- */
+const DEFAULT_PRICES = {
+  'deepseek-flash':   { hit: [0.02, 0.04], miss: [1, 2],   out: [4, 8] },
+  'deepseek-v4-flash':{ hit: [0.02, 0.04], miss: [1, 2],   out: [4, 8] },
+  'deepseek-v4-flash-vision-exp': { hit: [0.02, 0.04], miss: [1, 2], out: [4, 8] },
+  'deepseek-v4-pro':  { hit: [0.15, 0.30], miss: [4.5, 9], out: [13.5, 27] },
+};
+function loadPrices() {
+  const p = path.join(DSH_HOME, 'tools', 'prices.json');
+  try {
+    if (fs.existsSync(p)) return Object.assign({}, DEFAULT_PRICES, JSON.parse(fs.readFileSync(p, 'utf8')));
+  } catch (e) { process.stderr.write('warn: 读取 ' + p + ' 失败，用内置价格: ' + e.message + '\n'); }
+  return DEFAULT_PRICES;
+}
+
+/* ---------------- 会话日志解码（多帧 zstd） ---------------- */
+const ZSTD_MAGIC = 0xFD2FB528;
+function frameSize(b, off) {
+  if (off + 4 > b.length || b.readUInt32LE(off) !== ZSTD_MAGIC) return -1;
+  let i = off + 4;
+  const fhd = b[i++];
+  const fcsFlag = fhd >> 6, single = (fhd >> 5) & 1, checksum = (fhd >> 2) & 1, dictFlag = fhd & 3;
+  if (!single) i += 1;
+  i += [0, 1, 2, 4][dictFlag];
+  i += [single ? 1 : 0, 2, 4, 8][fcsFlag];
+  for (;;) {
+    if (i + 3 > b.length) return -1;
+    const h = b[i] | (b[i + 1] << 8) | (b[i + 2] << 16);
+    i += 3;
+    const last = h & 1, type = (h >> 1) & 3, size = h >> 3;
+    i += type === 1 ? 1 : size;
+    if (last) break;
+  }
+  if (checksum) i += 4;
+  return i - off;
+}
+function decodeSession(file) {
+  const b = fs.readFileSync(file);
+  const parts = [];
+  let off = 0;
+  while (off < b.length) {
+    const n = frameSize(b, off);
+    if (n <= 0) break;                       // 正在写入的半帧，忽略
+    try { parts.push(zlib.zstdDecompressSync(b.subarray(off, off + n)).toString('utf8')); }
+    catch { break; }
+    off += n;
+  }
+  return parts.join('');
+}
+
+/* ---------------- 时段判断 ----------------
+ * 高峰 = 北京时间周一至周五（不含中国法定节假日）9:00-12:00、14:00-18:00；
+ * 其余时段（含周末与法定节假日全天）为空闲，空闲单价 = 高峰单价的一半。
+ * 来源: https://api-docs.deepseek.com/zh-cn/quick_start/pricing/
+ */
+const HOLIDAY_RANGES = [
+  // [起始日, 结束日, 名称]（国务院办公厅 2026 年放假安排；调休上班的周末按周末算空闲）
+  ['2026-01-01', '2026-01-03', '元旦'],
+  ['2026-02-15', '2026-02-23', '春节'],
+  ['2026-04-04', '2026-04-06', '清明'],
+  ['2026-05-01', '2026-05-05', '劳动节'],
+  ['2026-06-19', '2026-06-21', '端午'],
+  ['2026-09-25', '2026-09-27', '中秋'],
+  ['2026-10-01', '2026-10-07', '国庆'],
+  ['2027-01-01', '2027-01-03', '元旦(待官方公布)'],
+];
+const DAY = 86400000;
+const dateFmt = new Intl.DateTimeFormat('en-CA', {
+  timeZone: TZ, year: 'numeric', month: '2-digit', day: '2-digit',
+});
+const partsFmt = new Intl.DateTimeFormat('en-CA', {
+  timeZone: TZ, weekday: 'short', hour: '2-digit', minute: '2-digit',
+  hour12: false, hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit',
+});
+const dayStr = ms => dateFmt.format(new Date(ms));
+function loadHolidays() {
+  const map = new Map();
+  const add = (ranges) => {
+    for (const [a, b, name] of ranges) {
+      let t = Date.parse(a + 'T00:00:00+08:00');
+      const end = Date.parse((b || a) + 'T00:00:00+08:00');
+      if (!Number.isFinite(t) || !Number.isFinite(end)) continue;
+      for (; t <= end; t += DAY) map.set(dayStr(t), name || '假期');
+    }
+  };
+  add(HOLIDAY_RANGES);
+  try {
+    const p = path.join(DSH_HOME, 'tools', 'holidays.json');
+    if (fs.existsSync(p)) add(JSON.parse(fs.readFileSync(p, 'utf8')));
+  } catch (e) { process.stderr.write('warn: 读取 holidays.json 失败: ' + e.message + '\n'); }
+  return map;
+}
+const HOLIDAYS = loadHolidays();
+function parts(ms) {
+  const o = {};
+  for (const p of partsFmt.formatToParts(new Date(ms))) o[p.type] = p.value;
+  return o;
+}
+function isWeekend(o) { return o.weekday === 'Sat' || o.weekday === 'Sun'; }
+function isPeak(ms) {
+  const o = parts(ms);
+  if (isWeekend(o)) return false;
+  if (HOLIDAYS.has(dayStr(ms))) return false;
+  const hour = Number(o.hour);
+  return (hour >= 9 && hour < 12) || (hour >= 14 && hour < 18);
+}
+/** 下一次高峰/空闲切换的时刻（毫秒）；找不到返回 null */
+function nextChange(ms) {
+  const cur = isPeak(ms);
+  for (let t = ms + 60000 - (ms % 60000); t < ms + 9 * DAY; t += 60000) {
+    if (isPeak(t) !== cur) return t;
+  }
+  return null;
+}
+function fmtDur(ms) {
+  const m = Math.max(0, Math.round(ms / 60000));
+  const h = Math.floor(m / 60);
+  return h ? h + 'h' + (m % 60 ? (m % 60) + 'm' : '') : m + 'm';
+}
+const WEEK_CN = { Mon: '周一', Tue: '周二', Wed: '周三', Thu: '周四', Fri: '周五', Sat: '周六', Sun: '周日' };
+function fmtClock(ms) {
+  const o = parts(ms);
+  const hm = o.hour + ':' + o.minute;
+  const d = dayStr(ms), today = dayStr(Date.now());
+  if (d === today) return hm;
+  if (dayStr(Date.now() + DAY) === d) return '明天 ' + hm;
+  return (WEEK_CN[o.weekday] || d) + ' ' + hm;
+}
+/** 供每轮播报的那一行：现在高峰还是空闲、何时切换 */
+function peakLine(ms) {
+  ms = ms || Date.now();
+  const peak = isPeak(ms);
+  const o = parts(ms);
+  const next = peak ? '空闲' : '高峰';
+  const rate = peak ? '全价' : '半价';
+  let why = '';
+  const hol = HOLIDAYS.get(dayStr(ms));
+  if (hol) why = '·' + hol + '假期全天空闲';
+  else if (isWeekend(o)) why = '·周末全天空闲';
+  const t = nextChange(ms);
+  return '\u23f0 现在' + (peak ? '高峰' : '空闲') + '（' + rate + '）' + why +
+    (t ? ' · ' + fmtClock(t) + ' 转' + next + '（' + fmtDur(t - ms) + '后）' : '');
+}
+
+/* ---------------- 会话枚举与统计 ---------------- *//**
+ * 会话日志文件名形如 session.v<N>.jsonl.zstd；新版 DSH 会升版本号（v3 → v4 …），
+ * 且**高版本是低版本的超集**（v4 从 seq 0 重写完整历史，v3 停止更新）。
+ * 所以每个会话只取版本号最高的那一个文件，绝不把多版本相加。
+ */
+function pickLog(dir) {
+  let best = null, bestV = -1;
+  let entries = [];
+  try { entries = fs.readdirSync(dir); } catch { return null; }
+  for (const f of entries) {
+    const m = /^session\.v(\d+)\.jsonl\.zstd$/.exec(f);
+    if (!m) continue;
+    const v = Number(m[1]);
+    if (v > bestV) { bestV = v; best = path.join(dir, f); }
+  }
+  return best ? { file: best, ver: 'v' + bestV } : null;
+}
+function listSessions() {
+  const root = path.join(DSH_HOME, 'sessions');
+  const out = [];
+  let projects = [];
+  try { projects = fs.readdirSync(root); } catch { return out; }
+  for (const proj of projects) {
+    const dir = path.join(root, proj);
+    let entries = [];
+    try { entries = fs.readdirSync(dir); } catch { continue; }
+    for (const name of entries) {
+      const log = pickLog(path.join(dir, name));
+      if (!log) continue;
+      try { out.push({ id: name, proj, file: log.file, ver: log.ver, mtime: fs.statSync(log.file).mtimeMs }); } catch {}
+    }
+  }
+  return out.sort((a, b) => b.mtime - a.mtime);
+}
+
+/** 只解第一个 zstd 帧（会话头就在第一行），用来读父子关系；不整文件解压。 */
+function firstLineJson(file) {
+  let b = null;
+  try {
+    const fd = fs.openSync(file, 'r');
+    const buf = Buffer.alloc(65536);
+    const n = fs.readSync(fd, buf, 0, buf.length, 0);
+    fs.closeSync(fd);
+    if (n > 0 && frameSize(buf.subarray(0, n), 0) > 0) b = buf.subarray(0, n);
+  } catch {}
+  if (!b) { try { b = fs.readFileSync(file); } catch { return null; } }
+  const sz = frameSize(b, 0);
+  if (sz <= 0) return null;
+  let txt; try { txt = zlib.zstdDecompressSync(b.subarray(0, sz)).toString('utf8'); } catch { return null; }
+  try { return JSON.parse(txt.split('\n', 1)[0]); } catch { return null; }
+}
+
+/** id -> {parent, origin, depth}；子代理会话是独立日志文件，靠 session.parentSession 关联 */
+function sessionMetaMap(sessions) {
+  const m = new Map();
+  for (const s of sessions) {
+    const ev = firstLineJson(s.file) || {};
+    m.set(s.id, { parent: ev.parentSession || null, origin: ev.origin || null, depth: ev.delegationDepth || 0 });
+  }
+  return m;
+}
+
+/** 本会话 + 它派生出来的全部子代理会话（BFS 整棵委派树） */
+function collectFamily(rootId, sessions, metaById) {
+  const byId = new Map(sessions.map(s => [s.id, s]));
+  const byParent = new Map();
+  for (const [id, meta] of metaById) {
+    if (!meta.parent) continue;
+    if (!byParent.has(meta.parent)) byParent.set(meta.parent, []);
+    byParent.get(meta.parent).push(id);
+  }
+  const out = [], seen = new Set(), queue = [rootId];
+  while (queue.length) {
+    const id = queue.shift();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    const s = byId.get(id);
+    if (s) out.push(s);
+    for (const c of byParent.get(id) || []) queue.push(c);
+  }
+  return out;
+}
+
+function statSession(sess, prices) {
+  const text = decodeSession(sess.file);
+  let createdAt = null;
+  const byModel = {};
+  let cost = 0, peakCalls = 0, calls = 0, tMiss = 0, tHit = 0, tOut = 0;
+  let extCalls = 0, extMiss = 0, extHit = 0, extOut = 0;
+  for (const line of text.split('\n')) {
+    if (!line) continue;
+    let ev; try { ev = JSON.parse(line); } catch { continue; }
+    if (ev.type === 'session' && ev.createdAt) createdAt = ev.createdAt;
+    if (ev.type !== 'assistant/message') continue;
+    const u = (ev.data && ev.data.usage) || {};
+    const src = (ev.data && ev.data.message && ev.data.message.source) || {};
+    const model = src.model || 'deepseek-flash';
+    const provider = src.provider || '';
+    const miss = u.inputTokens || 0, hit = u.cacheReadTokens || 0, out = u.outputTokens || 0;
+    /* 只有 DeepSeek 官方 provider 的调用才扣 DeepSeek 余额；
+       其他 provider（如 ark-code-latest / openai）费用记在别处，不能算进这里，
+       否则估算会虚高。 */
+    const external = provider ? !/deepseek/i.test(provider) : !/^deepseek/i.test(model);
+    const pr = external ? { hit: [0, 0], miss: [0, 0], out: [0, 0] }
+                        : (prices[model] || prices['deepseek-flash']);
+    const k = isPeak(ev.time || Date.now()) ? 1 : 0;
+    const c0 = (miss * pr.miss[k] + hit * pr.hit[k] + out * pr.out[k]) / 1e6;
+    calls++; if (k) peakCalls++;
+    if (external) { extCalls++; extMiss += miss; extHit += hit; extOut += out; }
+    tMiss += miss; tHit += hit; tOut += out; cost += c0;
+    const m = byModel[model] || (byModel[model] = { provider, external, calls: 0, miss: 0, hit: 0, out: 0, cost: 0 });
+    m.calls++; m.miss += miss; m.hit += hit; m.out += out; m.cost += c0;
+  }
+  return { sess, createdAt, calls, peakCalls, tMiss, tHit, tOut,
+           total: tMiss + tHit + tOut, cost, byModel,
+           extCalls, extMiss, extHit, extOut };
+}
+
+/* ---------------- 余额 ---------------- */
+function readApiKey() {
+  if (process.env.DEEPSEEK_API_KEY) return process.env.DEEPSEEK_API_KEY;
+  try {
+    const t = fs.readFileSync(path.join(DSH_HOME, '.credentials.yaml'), 'utf8');
+    const m = t.match(/DEEPSEEK_API_KEY:\s*(sk-[A-Za-z0-9_-]+)/);
+    if (m) return m[1];
+  } catch {}
+  return null;
+}
+async function fetchBalance() {
+  const key = readApiKey();
+  if (!key) return { error: '未找到 DEEPSEEK_API_KEY' };
+  try {
+    const r = await fetch('https://api.deepseek.com/user/balance', {
+      headers: { Authorization: 'Bearer ' + key }, signal: AbortSignal.timeout(20000),
+    });
+    if (r.ok) return await r.json();
+    if (r.status === 401) return { error: 'API Key 无效 (401)' };
+  } catch {}
+  try {
+    const out = execFileSync(CURL, ['-sk', '--max-time', '20',
+      '-H', 'Authorization: Bearer ' + key, 'https://api.deepseek.com/user/balance'],
+      { encoding: 'utf8' });
+    return JSON.parse(out);
+  } catch (e) { return { error: '查询失败: ' + e.message }; }
+}
+
+/* ---------------- 输出 ---------------- */
+const C = { dim: '\x1b[2m', b: '\x1b[1m', y: '\x1b[33m', g: '\x1b[32m', r: '\x1b[31m', x: '\x1b[0m' };
+const fmt = n => n.toLocaleString('en-US');
+const money = n => '\u00a5' + (n < 1 ? n.toFixed(4) : n.toFixed(2));
+
+function printBlock(s) {
+  const d = new Date(s.sess.mtime);
+  console.log(C.b + '会话' + C.x + ' ' + s.sess.id + ' ' + C.dim + '[' + s.sess.ver + ']' + C.x);
+  console.log('  ' + C.dim + '最后活动 ' + d.toLocaleString('zh-CN', { timeZone: TZ }) +
+    ' · 模型调用 ' + s.calls + ' 次（高峰 ' + s.peakCalls + '）' + C.x);
+  console.log('  token  未命中输入 ' + fmt(s.tMiss) + ' · 缓存命中 ' + fmt(s.tHit) +
+    ' · 输出 ' + fmt(s.tOut) + ' · 合计 ' + fmt(s.total));
+  const hitRate = (s.tMiss + s.tHit) ? (s.tHit / (s.tMiss + s.tHit) * 100).toFixed(1) : '0.0';
+  console.log('  费用   ' + C.y + C.b + money(s.cost) + C.x + '  ' + C.dim + '(缓存命中率 ' + hitRate + '%)' + C.x);
+  if (s.extCalls) {
+    console.log('  ' + C.dim + '另有非 DeepSeek 调用 ' + s.extCalls + ' 次（' + fmt(s.extMiss + s.extHit + s.extOut) +
+      ' tokens，不扣 DeepSeek 余额，未计入费用）' + C.x);
+  }
+}
+function printBalance(bal) {
+  if (bal.error) { console.log('  余额   ' + C.r + bal.error + C.x); return; }
+  const info = (bal.balance_infos || [])[0] || {};
+  const total = Number(info.total_balance || 0);
+  const color = total < 5 ? C.r : total < 20 ? C.y : C.g;
+  console.log('  余额   ' + color + C.b + (info.currency || 'CNY') + ' ' + total.toFixed(2) + C.x +
+    '  ' + C.dim + '(充值 ' + Number(info.topped_up_balance || 0).toFixed(2) +
+    ' / 赠送 ' + Number(info.granted_balance || 0).toFixed(2) + ')' + C.x);
+}
+
+/* ---------------- main ---------------- */
+(async () => {
+  const argv = process.argv.slice(2);
+  const has = f => argv.includes(f);
+  const val = f => { const i = argv.indexOf(f); return i >= 0 ? argv[i + 1] : null; };
+  const prices = loadPrices();
+
+  if (has('--peak')) {
+    const t = Date.now();
+    if (has('--json')) {
+      console.log(JSON.stringify({ now: t, peak: isPeak(t), changeAt: nextChange(t) }));
+    } else console.log(peakLine(t));
+    return;
+  }
+
+  if (has('--balance')) {
+    const bal = await fetchBalance();
+    if (has('--json')) console.log(JSON.stringify(bal));
+    else { console.log(peakLine(Date.now())); console.log(C.b + 'DeepSeek 账户' + C.x); printBalance(bal); }
+    return;
+  }
+
+  const sessions = listSessions();
+  if (!sessions.length) { console.error('没找到会话日志: ' + path.join(DSH_HOME, 'sessions')); process.exit(1); }
+
+  /* 默认会话 = 当前会话（环境变量 DSH_SESSION_ID，由 DSH 注入），
+     而不是「最近活动的会话」——别的窗口/别的项目可能正在并发跑，
+     按 mtime 选会选错（本文件历史 bug：只读 v3，导致永远报同一个旧会话）。 */
+  const explicit = val('--session');
+  const sid = explicit || (has('--all') || has('--today') ? null : (process.env.DSH_SESSION_ID || null));
+  const sidFromEnv = !explicit && !!sid;
+  let picked;
+  if (sid) picked = sessions.filter(s => s.id.includes(sid));
+  else if (has('--all')) picked = sessions;
+  else if (has('--today')) {
+    const start = new Date(); start.setHours(0, 0, 0, 0);
+    picked = sessions.filter(s => s.mtime >= start.getTime());
+    if (!picked.length) picked = [sessions[0]];
+  } else picked = [sessions[0]];
+  if (!picked.length && sidFromEnv) {
+    process.stderr.write('warn: 当前会话 ' + sid + ' 还没有日志文件，回退到最近活动的会话\n');
+    picked = [sessions[0]];
+  }
+  if (!picked.length) { console.error('没匹配到会话: ' + sid); process.exit(1); }
+
+  /* 单会话模式：把它派生的子代理会话一起算进来（子代理是独立日志文件，
+     费用同样扣 DeepSeek 余额；只报主日志会明显偏低）。 */
+  let family = false;
+  if (picked.length === 1) {
+    const fam = collectFamily(picked[0].id, sessions, sessionMetaMap(sessions));
+    if (fam.length > 1) { picked = fam; family = true; }
+  }
+
+  const stats = picked.map(s => statSession(s, prices));
+  const agg = stats.reduce((a, s) => ({
+    calls: a.calls + s.calls, peakCalls: a.peakCalls + s.peakCalls,
+    tMiss: a.tMiss + s.tMiss, tHit: a.tHit + s.tHit, tOut: a.tOut + s.tOut,
+    total: a.total + s.total, cost: a.cost + s.cost,
+    extCalls: a.extCalls + s.extCalls, extMiss: a.extMiss + s.extMiss,
+    extHit: a.extHit + s.extHit, extOut: a.extOut + s.extOut,
+  }), { calls: 0, peakCalls: 0, tMiss: 0, tHit: 0, tOut: 0, total: 0, cost: 0,
+        extCalls: 0, extMiss: 0, extHit: 0, extOut: 0 });
+
+  const bal = has('--no-net') ? null : await fetchBalance();
+
+  if (has('--json')) {
+    console.log(JSON.stringify({
+      peak: { now: isPeak(Date.now()), changeAt: nextChange(Date.now()) },
+      sessions: stats.map(s => ({ id: s.sess.id, ver: s.sess.ver, calls: s.calls, cost: s.cost,
+        uncachedInput: s.tMiss, cacheRead: s.tHit, output: s.tOut, total: s.total,
+        createdAt: s.createdAt, lastActive: s.sess.mtime,
+        externalCalls: s.extCalls, externalTokens: s.extMiss + s.extHit + s.extOut })),
+      total: agg, balance: bal }, null, 2));
+    return;
+  }
+
+  console.log(peakLine(Date.now()));
+
+  if (picked.length === 1) printBlock(stats[0]);
+  else if (family) {
+    /* 本会话合计（含子会话）：把「费用」行直接换成合计，播报才不会偏低 */
+    printBlock(Object.assign({}, agg, { sess: stats[0].sess }));
+    console.log('  ' + C.dim + '含 ' + (stats.length - 1) + ' 个子会话 ' +
+      stats.slice(1).map(s => money(s.cost)).join(' + ') + C.x);
+  } else {
+    console.log(C.b + picked.length + ' 个会话合计' + C.x);
+    console.log('  模型调用 ' + agg.calls + ' 次 · token ' + fmt(agg.total) +
+      '（未命中 ' + fmt(agg.tMiss) + ' / 命中 ' + fmt(agg.tHit) + ' / 输出 ' + fmt(agg.tOut) + '）');
+    console.log('  费用   ' + C.y + C.b + money(agg.cost) + C.x);
+    for (const s of stats.slice(0, 8)) {
+      console.log('    ' + C.dim + money(s.cost).padStart(9) + '  ' + s.sess.id + C.x);
+    }
+    if (stats.length > 8) console.log('    ' + C.dim + '… 其余 ' + (stats.length - 8) + ' 个' + C.x);
+  }
+  if (bal) printBalance(bal);
+  console.log(C.dim + '  高峰=周一至周五(非法定节假日)9-12/14-18，其余(含周末/假期全天)空闲半价；价格表 $DSH_HOME/tools/prices.json' + C.x);
+})();

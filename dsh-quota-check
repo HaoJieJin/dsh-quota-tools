@@ -1,0 +1,339 @@
+#!/usr/bin/env node
+/**
+ * dsh-quota-check —— 子代理路由的「起飞前检查 + 干涸记忆」。
+ *
+ * 两部分信息源：
+ *   1) dsh-quota 插件的只读实时快照 http://127.0.0.1:3080/dsh-quota/snapshot（无需鉴权）
+ *   2) 本地干涸记忆 quota-memory.json —— 记录「今天这条已经用完了」
+ *      （快照看不到的：商汤无接口；快照估算滞后的：CF / 魔搭）
+ *
+ * 用法：
+ *   dsh-quota-check                                  人类可读摘要
+ *   dsh-quota-check --json                           原始快照
+ *   dsh-quota-check --pick default|long|short|vision 推荐一条（跳过 dry）
+ *   dsh-quota-check --check <provider>/<model>       只问这一条
+ *   dsh-quota-check --dry <provider>/<model> [原因]  记下「今天这条用完了」
+ *   dsh-quota-check --undry <provider>/<model>       撤销
+ *   dsh-quota-check --clear                          清空今天的记忆
+ *
+ * 退出码：可用=0，干涸=2，未知=3。
+ * ⚠ 只改 quota-memory.json，绝不改额度状态、不改 DSH 配置。
+ */
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const PORT = process.env.DSH_PORT || "3080";
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const URL = `http://127.0.0.1:${PORT}/dsh-quota/snapshot`;
+const MEM = process.env.DSH_QUOTA_MEM || join(__dirname, "../../quota-memory.json");
+
+const today = () => new Date().toLocaleDateString("sv-SE", { timeZone: "Asia/Shanghai" });
+const DSH_HOME = process.env.DSH_HOME || join(__dirname, "../../payload/dshhome");
+/** 魔搭余额是「抄录值」，必须看抄录时间有多旧。返回分钟数，读不到返回 null。 */
+function magicAgeMin() {
+  try {
+    const st = JSON.parse(readFileSync(DSH_HOME + "/storages/dsh-quota/state.json", "utf8"));
+    const at = st?.magic?.at;
+    return at ? Math.round((Date.now() - at) / 60000) : null;
+  } catch { return null; }
+}
+
+// ⚠ 表内位次 = 消耗顺序（**表顺序只在这些路由都被判为可用时才说了算**，见下面 FREE_UNTRACKED）
+//   规矩（用户 2026-09-27 定，2026-09-28 按实测结果重排）：
+//   ① 持续免费 / 每天重置的先用光（不用就浪费）
+//   ② 「周」级（商汤）留到日额度干了再用
+//   ③ deepseek-official（真花钱）永远最后（千问 aly 不自动选：它不在子代理白名单，
+//      且自动选付费路由有花钱风险；要便宜兜底就显式指定并用 reset-balance 记余额）
+//
+//   2026-09-28 01:1x 全量直连 + 引擎侧实测（详见 files/免费模型池接入清单.md）：
+//     ✅ bigmodel（智谱 GLM Flash 系）glm-4.7-flash 引擎侧通；glm-4-flash-250414 / 4.6v-flash 直连通
+//        → 唯一「持续免费 + 有容量互备」的池 → 置顶，并新增 glm-4-flash-250414 作容量备胎
+//        （glm-4.7-flash 高峰期 429「访问量过大」，可重试/换它）
+//     ✅ hunyuan（TokenHub 新平台）hy4-preview / hy3 / hy-vision-2.0-instruct / 
+//        deepseek-v4-flash-0731 / glm-5.3 / kimi-k3 全部 200 → 但**计费未核实 → 不进表**
+//     ✅ sensenova deepseek-v4-pro(空内容=思考吃满) / glm-5.2 / deepseek-flash / 6.8-flash-lite 通
+//     ✅ openai(ark) 正常；deepseek-official 正常
+//     ⛔ modelscope：**7 条新模型全 429「insufficient balance」**（魔粒当天已干）→ 靠 --dry 记忆
+//     ⛔ cloudflare-workers-ai：**真实 429「used up your daily free allocation ... 4006」**
+//        （不是估算！）→ 悬浮球已改成优先采信真实 429
+//     ❌ siliconflow：Qwen3-8B 仍 402「balance is insufficient」→ 判死
+//     ⚠ mistral：open-mistral-nemo 直连 200（被别名成 ministral-8b-2512）但引擎侧曾稳定 422
+//     ✅ xiaomi（小米 MiMo，2026-09-28 接入）：**已是用户主模型**（`mimo-v2.6-pro`）。
+//        baseURL https://api.xiaomimimo.com/v1；直连实测 200 + **tool calling 正常** + 多轮 tool 回传正常；
+//        定价 ¥3/¥6（pro）、¥1/¥2（flash），缓存命中 ¥0.025、**缓存写入限时免费**；1M 上下文。
+//        ⚠ 无余额查询 API；⚠ v2.5 系列 2026-10-21 下线 → 只用 v2.6。
+//        放在付费兜底档（hunyuan 之后、deepseek-official 之前）。
+//
+//   ✅ 腾讯 TokenHub（hunyuan provider）2026-09-28 查实：**每个新账号一次性免费 100 万 tokens**
+//      （腾讯云官方文档 "How to Claim 1 Million Free Tokens for New Users on TokenHub Model Gallery"；
+//       free quota 独立于 Token Plan，用完转按量付费）。用户已**关闭付费** → 用完只会报错、不会扣费。
+//       → 故按用户 2026-09-28 指示，**加进免费档最后一位**（deepseek-official 之前）。
+//       ⚠ 是「一次性」不是「每天重置」，用光要等充值或换号；插件会捕获真实报错自动判干涸。
+const ROUTES = {
+  // 2026-09-28 11:00 重排（用户要求：**先烧「每日重置」的额度池**，但效率不能差、
+  // 模型不能拥堵）。实测依据（同一时段真打 chat completion）：
+  //   ark-code-latest        2.4s 直出正文、日窗口每日重置  → 默认首选
+  //   Qwen3.8-27B            2-4s（思考型但正文正常）、日魔粒重置
+  //   glm-4-flash-250414     0.9s 直出、两轮均稳（持续免费）→ 保底
+  //   ✗ glm-4.7-flash        会 429「访问量过大」+ 思考型（实测一次 146s）→ 降级
+  //   ✗ cloudflare            日额度仅 10k 且被滚动窗口卡住 → 移出子代理，专供 ModLens 识图
+  // ⭐ 2026-09-30 11:17 三改（用户：「子代理别都用火山 plan，新加的模型也用上，
+  //    别的免费模型尽量都用上，别浪费」）。本日实测速度（各 3 次取中位）：
+  //      bigmodel/glm-4-flash-250414  1.30s  ← 持续免费·最快·不消耗任何额度池
+  //      hunyuan/kimi-k2.7-code       2.83s  ← 腾讯 TokenHub 免费（今日实测 200）
+  //      hunyuan/glm-5.3-flashx       2.89s  ← 腾讯 TokenHub 免费（tool call 实测通）
+  //      aly/deepseek-v4.1-flash      3.24s（**有 17s 长尾**）百炼免费 1M·1M 窗口
+  //      openai/ark-code-latest       记录 2.4s（火山付费套餐·每日窗口）
+  //    ⛔ 2026-09-30 用户实报：**modelscope 今日额度已用完**（已 --dry 记账，明天恢复）
+  // 分档思路（2026-09-30 定）：
+  //   default → 能力优先但仍免费：hunyuan/glm-5.3-flashx（2026 代·tool call 实测通·2.89s）
+  //   short   → 速度优先：bigmodel/glm-4-flash-250414（1.30s·持续免费）
+  //   long    → 窗口优先：aly/deepseek-v4.1-flash（1M 窗口·免费 1M tokens）
+  //   vision  → hunyuan/hy-vision-2.0-instruct（实测 1.1s）
+  default: [
+    ["hunyuan", "glm-5.3-flashx", "腾讯 glm-5.3-flashx（TokenHub 免费·**tool call 实测通**·2026 代·中位 2.89s→默认首选）"],
+    ["unisound", "u2-flash", "云知声 U2-Flash（**限时免费不限量 09/30-10/31**·512K 窗口·实测 15k 负载 8.09s·无提示缓存→排第三）"],
+    ["bigmodel", "glm-4-flash-250414", "智谱 GLM-4-Flash-250414（持续免费·**实测中位 1.30s**·最快·保底）"],
+    ["hunyuan", "kimi-k2.7-code", "腾讯 kimi-k2.7-code（TokenHub 免费·代码向·中位 2.83s）"],
+    ["openai", "ark-code-latest", "火山方舟 ark（256k·5小时/今日窗口**每日重置**·实测 2.4s 直出·该用就用）"],
+    ["aly", "deepseek-v4.1-flash", "百炼 deepseek-v4.1-flash（**免费 1M tokens·1M 窗口**·中位 3.24s·⚠有 17s 长尾）"],
+    ["modelscope", "Qwen/Qwen3.8-27B", "魔搭 Qwen3.8-27B（日重置·实测 2-4s·⛔2026-09-30 已用完）"],
+    ["modelscope", "deepseek-ai/DeepSeek-V4-Flash-0731", "魔搭 DeepSeek-V4-Flash（日重置·1.31M 长窗口·⛔2026-09-30 已用完）"],
+    ["bigmodel", "glm-4.7-flash", "智谱 GLM-4.7-Flash（持续免费但**会 429 + 思考型**·降级备用）"],
+    ["sensenova", "deepseek-v4-flash", "商汤 DeepSeek-V4-Flash（1.31M·⚠ 周额度，日额度用完才用）"],
+    ["hunyuan", "hy4-preview", "腾讯 TokenHub hy4-preview（⚠ 一次性免费 100 万 tokens；用完只报错不扣费）"],
+    ["xiaomi", "mimo-v2.6-flash", "小米 MiMo V2.6-Flash（¥1/¥2·1M·便宜付费兜底）"],
+    ["deepseek-official", "deepseek-flash", "DeepSeek 官方 flash（花钱·最后）"],
+  ],
+  long: [
+    ["modelscope", "deepseek-ai/DeepSeek-V4-Flash-0731", "魔搭 DeepSeek-V4-Flash（日魔粒·**1.31M**→长任务首选）"],
+    ["modelscope", "deepseek-ai/DeepSeek-V4-Pro-0813", "魔搭 DeepSeek-V4-Pro（日重置·1.05M·⛔2026-09-30 已用完）"],
+    ["aly", "deepseek-v4.1-flash", "百炼 deepseek-v4.1-flash（**免费 1M tokens·1M 窗口·长任务首选**·今日实测 200）"],
+    ["hunyuan", "glm-5.3-flashx", "腾讯 glm-5.3-flashx（TokenHub 免费·tool call 实测通）"],
+    ["unisound", "u2-flash", "云知声 U2-Flash（**限时免费不限量**·512K 窗口·长任务可用·活动到 10/31）"],
+    ["openai", "ark-code-latest", "火山方舟 ark（每日重置窗口·256k）"],
+    ["modelscope", "Qwen/Qwen3.8-27B", "魔搭 Qwen3.8-27B（日魔粒·262k）"],
+    ["bigmodel", "glm-4-flash-250414", "智谱 GLM-4-Flash-250414（持续免费·0.9s）"],
+    ["sensenova", "deepseek-v4-flash", "商汤 DeepSeek-V4-Flash（1.31M·⚠ 周额度）"],
+    ["hunyuan", "hy3", "腾讯 TokenHub hy3（⚠ 一次性 100 万 tokens；用完只报错）"],
+    ["xiaomi", "mimo-v2.6-pro", "小米 MiMo V2.6-Pro（¥3/¥6·1M·缓存命中 ¥0.025）"],
+    ["deepseek-official", "deepseek-v4-pro", "DeepSeek 官方 pro（花钱·最后）"],
+  ],
+  short: [
+    ["bigmodel", "glm-4-flash-250414", "智谱 GLM-4-Flash-250414（持续免费·**实测中位 1.30s**·短小活首选）"],
+    ["hunyuan", "kimi-k2.7-code", "腾讯 kimi-k2.7-code（TokenHub 免费·中位 2.83s）"],
+    ["openai", "ark-code-latest", "火山方舟 ark（**每日重置**·短小活优先烧·实测 2.4s 直出）"],
+    ["modelscope", "Qwen/Qwen3.8-27B", "魔搭 Qwen3.8-27B（日魔粒）"],
+    ["bigmodel", "glm-4.7-flash", "智谱 GLM-4.7-Flash（会 429·降级备用）"],
+    ["sensenova", "deepseek-v4-flash", "商汤 DeepSeek-V4-Flash（⚠ 周额度）"],
+    ["hunyuan", "hy4-preview", "腾讯 TokenHub hy4-preview（⚠ 一次性）"],
+    ["xiaomi", "mimo-v2.6-flash", "小米 MiMo V2.6-Flash（¥1/¥2·便宜付费兜底）"],
+    ["deepseek-official", "deepseek-flash", "DeepSeek 官方 flash（花钱·最后）"],
+  ],
+  // 看图专用：CF 已移出子代理（专供 ModLens 插件），这里不再推荐 CF；
+  // 首选实测 1.1s 就通的 TokenHub 视觉款，智谱 V 款高峰会 429 放第二。
+  vision: [
+    ["hunyuan", "hy-vision-2.0-instruct", "腾讯 TokenHub Vision 2.0（实测 1.1s 正常·一次性免费额度）"],
+    ["bigmodel", "glm-4.6v-flash", "智谱 GLM-4.6V-Flash（持续免费·高峰 429 已实锤·备用）"],
+  ],
+};
+
+function readMem() {
+  try {
+    const m = JSON.parse(readFileSync(MEM, "utf8"));
+    return m.day === today() ? m : { day: today(), dry: {} };
+  } catch {
+    return { day: today(), dry: {} };
+  }
+}
+function writeMem(m) {
+  mkdirSync(dirname(MEM), { recursive: true });
+  writeFileSync(MEM, JSON.stringify({ ...m, day: today() }, null, 1));
+}
+/** 记忆里有没有这条（provider 级或 provider/model 级） */
+function memDry(m, provider, model) {
+  const a = m.dry[provider];
+  const b = m.dry[`${provider}/${model}`];
+  return b || a || null;
+}
+
+function getJson(url) {
+  return new Promise((resolve, reject) => {
+    import("node:http").then(({ get }) => {
+      get(url, (res) => {
+        let b = "";
+        res.on("data", (c) => (b += c));
+        res.on("end", () => { try { resolve(JSON.parse(b)); } catch (e) { reject(new Error("bad json")); } });
+      }).on("error", reject);
+    });
+  });
+}
+
+function evaluate(snap) {
+  const out = {};
+  for (const it of snap.items || []) {
+    const p = it.id;
+    let state = "available", why = it.text || "";
+    const notes = [];
+    // 通用：插件捕获到厂商「额度/余额用尽」真实报错 → 直接判干涸（优先级最高）
+    const realExhausted = it.exhausted === true;
+    if (realExhausted) { state = "dry"; why = `厂商实测额度用尽：${it.exhaustedReason || it.text || ""}`; }
+    if (p === "cloudflare-workers-ai") {
+      if (typeof it.remaining === "number" && it.remaining <= 0) { state = "dry"; why = `neuron 额度已用尽（${it.text}）`; }
+      else notes.push("按费率估算，非官方真实用量");
+    } else if (p === "modelscope") {
+      const m = /余额\s*(\d+(?:\.\d+)?)/.exec(it.note || "") || /(\d+(?:\.\d+)?)\s*魔粒/.exec(it.text || "");
+      if (m && Number(m[1]) <= 0) { state = "dry"; why = "魔粒余额为 0"; }
+      else if (!m) { state = "unknown"; why = "没有当天抄录的魔粒余额"; }
+      else {
+        const age = magicAgeMin();
+        if (age !== null && age > 30) {
+          state = "stale";
+          why = `抄录值「${m[1]} 魔粒」是 ${age} 分钟前的，已不可信`;
+        } else {
+          notes.push(`余额 ${m[1]} 魔粒（抄录值${age !== null ? "，" + age + " 分钟前" : ""}）`);
+        }
+      }
+    } else if (p === "openai") {
+      const ws = it.windows || [];
+      const worst = ws.length ? Math.min(...ws.map((w) => Number(w.remainingPercent ?? 100))) : 100;
+      const tight = ws.find((w) => Number(w.remainingPercent ?? 100) === worst);
+      if (worst <= 0) { state = "dry"; why = `套餐窗口「${tight?.name}」已用尽`; }
+      else notes.push(`最紧窗口「${tight?.name}」剩 ${worst.toFixed(1)}%`);
+    } else if (p === "deepseek-official") {
+      if (typeof it.balance === "number" && it.balance <= 0.5) { state = "dry"; why = `余额仅 ¥${it.balance}`; }
+    } else if (p === "sensenova") { state = "unknown"; why = "商汤官方无额度查询接口，读不到"; }
+    else if (p === "aly") { if (typeof it.balance === "number" && it.balance <= 0.01) { state = "dry"; why = `余额仅 ¥${it.balance}`; } }
+    // realExhausted 判干涸后，不要再被 provider 分支的 available/unknown 覆盖
+    if (realExhausted) state = "dry";
+    out[p] = { state, why, notes, label: it.label, exhausted: realExhausted, exhaustedReason: it.exhaustedReason };
+  }
+  return out;
+}
+
+const ICON = { available: "✅", dry: "⛔", stale: "⚠️", unknown: "❓" };
+const argVal = (argv, k) => { const i = argv.indexOf(k); return i === -1 ? null : (argv[i + 1] ?? ""); };
+
+async function main() {
+  const argv = process.argv.slice(2);
+  const mem = readMem();
+
+  // ── 记忆写入类操作（不需要快照）──
+  const dryRoute = argVal(argv, "--dry");
+  if (dryRoute !== null && dryRoute !== "") {
+    const reason = argv[argv.indexOf("--dry") + 2] || "手动标记";
+    mem.dry[dryRoute] = { reason, at: Date.now() };
+    writeMem(mem);
+    console.log(`⛔ 已记下：${dryRoute} 今天不可用 — ${reason}`);
+    console.log(`   记忆文件：${MEM}（day=${today()}，明天自动失效）`);
+    return;
+  }
+  const undry = argVal(argv, "--undry");
+  if (undry) {
+    const had = mem.dry[undry];
+    delete mem.dry[undry];
+    writeMem(mem);
+    console.log(had ? `✅ 已撤销：${undry}` : `（本来就没记：${undry}）`);
+    return;
+  }
+  if (argv.includes("--clear")) {
+    writeMem({ day: today(), dry: {} });
+    console.log("✅ 已清空今天的干涸记忆");
+    return;
+  }
+
+  let snap;
+  try { snap = await getJson(URL); }
+  catch (e) {
+    console.error(`❌ 读不到额度快照（${URL}）：${e.message}`);
+    console.error(`   → 确认 DSH 在运行、端口是 ${PORT}（可用 DSH_PORT=<port> 覆盖）`);
+    process.exit(3);
+  }
+  if (argv.includes("--json")) { console.log(JSON.stringify(snap, null, 1)); return; }
+
+  const byProv = evaluate(snap);
+  // ⚠ 快照里没有的 provider（dsh-quota 插件不认识它们）默认会被判成 unknown，
+  //   而 --pick 的排序是 available(0) < stale(1) < unknown(2) —— unknown 会被排到
+  //   available 后面，**让 ROUTES 的表顺序失效**。这里显式声明「免费且无额度可查」的
+  //   provider，让它们按 available 参与排序，表顺序才真正等于优先级。
+  const FREE_UNTRACKED = {
+    bigmodel: "免费 Flash 系持续可用、无额度概念（2026-09-28 实测 3 条全通）",
+    hunyuan:
+      "腾讯 TokenHub：新账号一次性免费 100 万 tokens（官方文档，用完转按量；用户已关付费 → 用完只会报错不会扣费）",
+  };
+  const res = (prov, model) => {
+    let s = byProv[prov];
+    if (!s) {
+      const why = FREE_UNTRACKED[prov];
+      s = why
+        ? { state: "available", why, notes: [] }
+        : { state: "unknown", why: "快照里没有这个 provider", notes: [] };
+    }
+    // 插件捕获到厂商「额度用尽」类真实报错 → 直接判干涸（比估算可信）
+    if (s.state !== "dry" && s.exhausted === true) {
+      return { state: "dry", why: `厂商实测：额度已用尽（${s.exhaustedReason || "真实报错"}）`, notes: s.notes };
+    }
+    const md = memDry(mem, prov, model);
+    if (md) return { state: "dry", why: `今天已记干涸：${md.reason}`, notes: s.notes };
+    return s;
+  };
+
+  const check = argVal(argv, "--check");
+  if (check) {
+    const i = check.indexOf("/");
+    const prov = i === -1 ? check : check.slice(0, i);
+    const model = i === -1 ? "*" : check.slice(i + 1);
+    const st = res(prov, model);
+    console.log(`${ICON[st.state]} ${prov}/${model}  ${st.state}  — ${st.why}`);
+    process.exit(st.state === "available" ? 0 : st.state === "dry" ? 2 : 3);
+  }
+
+  const pick = argVal(argv, "--pick");
+  if (pick) {
+    if (!ROUTES[pick]) { console.error(`❌ 未知形状 ${pick}（可选 default|long|short|vision）`); process.exit(3); }
+    const RANK = { available: 0, stale: 1, unknown: 2 };
+    const cands = ROUTES[pick].map(([prov, model, name], i) => ({ prov, model, name, i, st: res(prov, model) }));
+    for (const c of cands) {
+      console.log(`${ICON[c.st.state]} ${c.st.state === "dry" ? "跳过" : "候选"} ${c.prov}/${c.model} — ${c.st.why}`);
+    }
+    const ok = cands.filter((c) => c.st.state !== "dry")
+      .sort((a, b) => (RANK[a.st.state] ?? 3) - (RANK[b.st.state] ?? 3) || a.i - b.i);
+    if (ok.length === 0) {
+      console.log(`⛔ 【${pick}】里所有路由都不可用（免费+火山都干了）→ 只能上 deepseek-official 或等重置`);
+      process.exit(2);
+    }
+    const w = ok[0];
+    console.log();
+    console.log(`${ICON[w.st.state]} 推荐【${pick}】→ ${w.prov}/${w.model}`);
+    console.log(`   ${w.name}`);
+    console.log(`   依据：${w.st.why || "额度正常"}${w.st.notes.length ? " · " + w.st.notes.join(" · ") : ""}`);
+    if (w.st.state !== "available") console.log(`   ⚠ 这条不是「确定可用」（${w.st.state}）——失败就 --dry 它、再换下一条`);
+    console.log(`   调用：subagent(..., provider: "${w.prov}", model: "${w.model}")`);
+    process.exit(0);
+  }
+
+  console.log(`额度快照 · day=${snap.day} · 更新 ${new Date(snap.updatedAt).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" })}`);
+  if (snap.warning) console.log(`⚠ ${snap.warning}`);
+  const memN = Object.keys(mem.dry).length;
+  console.log(`干涸记忆：${memN ? memN + " 条（" + Object.keys(mem.dry).join(", ") + "）" : "无"}`);
+  // 快照里可能有「不在 --pick 阶梯里」的 provider：分两种标注，免得上当。
+  const inRoutes = new Set(Object.values(ROUTES).flat().map(([p]) => p));
+  // 白名单里有、但故意不进阶梯的（典型：hunyuan/TokenHub 计费未核实）
+  const whitelistedButNotRouted = { hunyuan: "可显式指定，但 ⚠ 计费未核实，别当免费资源默认用" };
+  console.log();
+  for (const [prov, st] of Object.entries(byProv)) {
+    const s = res(prov, "*");
+    const tag = inRoutes.has(prov)
+      ? ""
+      : whitelistedButNotRouted[prov]
+        ? `  ⚠ 不在任何 --pick 阶梯里（${whitelistedButNotRouted[prov]}）`
+        : "  ⚠ 不在任何 --pick 阶梯里（也不在子代理白名单，显式选会被 Session 拒）";
+    console.log(`${ICON[s.state]} ${String(prov).padEnd(22)} ${s.state.padEnd(10)} ${s.why}${tag}`);
+    for (const n of s.notes) console.log(`      · ${n}`);
+  }
+  console.log();
+  console.log("按任务形状挑：--pick default|long|short|vision    ／ 标记干涸：--dry <provider>/<model> [原因]");
+}
+
+main();
