@@ -1,5 +1,7 @@
 # DSH Quota Tools
 
+**🌐 [English](README.md) | [简体中文](README.zh-CN.md)**
+
 Two companion CLI tools for the **DeepSeek Harness (DSH)** agent platform.
 
 | Tool | Purpose |
